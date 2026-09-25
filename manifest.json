@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 1,
+  "id": "brightwalker25.vpn-check",
+  "name": "VPN Check",
+  "version": "0.2.1",
+  "author": "brightwalker25",
+  "license": "MIT",
+  "description": "VPN and DNS posture at a glance: exit address, who hosts it, where DNS resolves, and whether anything is leaking",
+  "kinds": [
+    "bar-widget"
+  ],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "VPN Check",
+    "description": "Your real IP, the address the VPN gives you, who hosts it, where DNS resolves from, and a traffic light against each",
+    "category": "Network",
+    "aliases": [
+      "vpn",
+      "vpn-check",
+      "dns",
+      "leak",
+      "ip",
+      "privacy"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalMs": 60000,
+      "lookupTimeoutSeconds": 6,
+      "ipinfoToken": ""
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalMs",
+        "type": "integer",
+        "label": "Re-check every (ms)",
+        "min": 10000,
+        "max": 600000,
+        "step": 5000,
+        "defaultValue": 60000,
+        "description": "How often the full checks re-run while the panel is open. While it is closed only the local check runs, once a minute, and it sends no packets."
+      },
+      {
+        "key": "lookupTimeoutSeconds",
+        "type": "integer",
+        "label": "Lookup timeout (seconds)",
+        "min": 2,
+        "max": 20,
+        "step": 1,
+        "defaultValue": 6,
+        "description": "How long each outbound lookup may take before it is reported as unknown."
+      },
+      {
+        "key": "ipinfoToken",
+        "type": "string",
+        "label": "ipinfo.io token",
+        "defaultValue": "",
+        "description": "Optional. Raises the anonymous rate limit on the address lookups. Leave empty to stay anonymous."
+      }
+    ]
+  }
+}

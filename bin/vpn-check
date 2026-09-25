@@ -1,0 +1,1399 @@
+#!/usr/bin/env python3
+"""Emit one snapshot of VPN and DNS posture as JSON, for the
+brightwalker25.vpn-check bar panel.
+
+Design notes:
+
+- The collector decides, the panel renders. Every judgement about whether
+  something is fine, questionable or wrong is made here and shipped as a
+  status string, so the QML holds no policy and this file can be read,
+  run and argued with from a terminal.
+- Local probes never send a packet. Which interface a packet *would* leave
+  by is answered with `ip route get`, which consults the routing tables and
+  returns; it does not transmit. That matters because the naive way to test
+  for a leak is to send traffic outside the tunnel, which causes the leak
+  it is testing for.
+- The real IP is never obtained by deliberately bypassing the tunnel. It
+  comes from one of three honest sources, in descending preference:
+  observed live while no tunnel was up (and cached for later), read from
+  that cache, or inferred from a globally routable IPv6 address the ISP has
+  already assigned to the physical interface, which is visible locally.
+- Network probes are optional (`--local` omits them entirely) and run in
+  parallel with tight timeouts, because a panel that hangs is worse than a
+  panel that says it does not know.
+
+Exit status is 0 whenever a snapshot was produced, even a partial one.
+Failures are reported inside the JSON rather than as an exit code, because a
+half-answer is still worth drawing.
+"""
+import argparse
+import concurrent.futures as futures
+import http.client
+import ipaddress
+import json
+import os
+import random
+import socket
+import ssl
+import struct
+import subprocess
+import sys
+import time
+
+CACHE_DIR = os.path.join(
+    os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+    "omarchy-vpn-check",
+)
+GEO_TTL_SECONDS = 7 * 24 * 3600
+
+# Destinations used only as routing-table lookup keys. No packet is sent to
+# either; they are well-known addresses chosen because they will never be
+# covered by a more specific route and so always resolve to the default path.
+PROBE_V4 = "1.1.1.1"
+PROBE_V6 = "2606:4700:4700::1111"
+
+# Interface kinds that are a tunnel, and name prefixes for the ones that do
+# not announce a kind. OpenVPN's tun devices report no info_kind on some
+# kernels, so the name heuristic is a genuine fallback rather than belt and
+# braces.
+TUNNEL_KINDS = {"wireguard", "tun", "ppp", "vti", "vti6", "ipip", "gre"}
+TUNNEL_NAME_HINTS = ("tun", "tap", "wg", "proton", "nordlynx", "mullvad", "vpn")
+
+# Interfaces that look like a tunnel but are scaffolding. one VPN client's IPv6
+# kill switch is a dummy device holding an unroutable address; treating it as
+# the tunnel would report a connection that carries nothing.
+NOT_A_TUNNEL_KINDS = {"dummy", "bridge", "veth", "loopback"}
+
+# Interfaces that exist to swallow traffic. A dummy device discards whatever is
+# routed into it, which is how a kill switch blocks a family it cannot carry:
+# One VPN client parks a default IPv6 route on `ipv6leakintrf0` so v6 packets are
+# dropped locally instead of leaving beside the tunnel. A route landing here is
+# the protection working, not an escape.
+SINK_KINDS = {"dummy"}
+
+
+def run(cmd, timeout=4.0):
+    """Stdout of a command, or None if it failed in any way."""
+    try:
+        p = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if p.returncode != 0:
+        return None
+    return p.stdout
+
+
+def run_json(cmd, timeout=4.0):
+    out = run(cmd, timeout)
+    if not out:
+        return None
+    try:
+        return json.loads(out)
+    except ValueError:
+        return None
+
+
+# ------------------------------------------------------------------ caching
+
+
+def cache_read(name, ttl=None):
+    path = os.path.join(CACHE_DIR, name)
+    try:
+        with open(path) as fh:
+            blob = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if ttl is not None and time.time() - blob.get("_cachedAt", 0) > ttl:
+        return None
+    return blob
+
+
+def cache_write(name, blob):
+    path = os.path.join(CACHE_DIR, name)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        blob = dict(blob)
+        blob["_cachedAt"] = time.time()
+        # Written via a temporary file so a poll interrupted mid-write cannot
+        # leave a truncated cache that then fails to parse forever.
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(blob, fh)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+# ------------------------------------------------------------- local probes
+
+
+def links():
+    return run_json(["ip", "-d", "-j", "link", "show"]) or []
+
+
+def addresses():
+    return run_json(["ip", "-j", "addr", "show"]) or []
+
+
+def route_get(dest, source=None, oif=None):
+    """The interface a packet to `dest` would leave by, without sending one.
+
+    `source` asks the question an application asks when it binds to an
+    address; `oif` asks the one it asks when it binds to the interface
+    itself. They are separate lookups and on a policy-routed VPN they give
+    separate answers, because a fwmark rule that catches the address does not
+    catch the device.
+    """
+    cmd = ["ip", "-j", "route", "get", dest]
+    if source:
+        cmd += ["from", source]
+    if oif:
+        cmd += ["oif", oif]
+    res = run_json(cmd, timeout=2.0)
+    if not res:
+        return None
+    entry = res[0] if isinstance(res, list) and res else None
+    if not isinstance(entry, dict):
+        return None
+    return entry.get("dev")
+
+
+def default_routes(family):
+    """(device, metric) for every default route of `family` in the main table.
+
+    All of them, not just the winner: a kill switch works by parking a route
+    that beats the open connection's, so the comparison needs both.
+    """
+    flag = "-6" if family == 6 else "-4"
+    out = []
+    for r in run_json(["ip", flag, "-j", "route", "show", "default"]) or []:
+        dev = r.get("dev")
+        if dev:
+            out.append((dev, r.get("metric") or 0))
+    return out
+
+
+def kill_switch_cover(ifaces, tunnel):
+    """Per family, the sink devices that would still hold if the tunnel went.
+
+    A kill switch is a device that swallows traffic plus a default route into
+    it that beats the open connection's. The name of a NetworkManager
+    connection is a label rather than the protection itself, and it is not
+    even a label for the whole machine: a kill switch connection such as `pvpn-killswitch-ipv6`
+    covers IPv6 alone, while IPv4 is guarded by a separate connection that
+    stays inactive unless the permanent kill switch is turned on. Answering
+    the two families separately is the only way to avoid calling half a kill
+    switch a whole one.
+
+    The tunnel's own default is excluded from the comparison because the
+    question is what happens once the tunnel is gone.
+    """
+    cover = {}
+    for family in (4, 6):
+        routes = default_routes(family)
+        open_metric = min(
+            [m for dev, m in routes if dev != tunnel and not is_sink(dev, ifaces)],
+            default=None,
+        )
+        cover[family] = sorted({
+            dev for dev, m in routes
+            if is_sink(dev, ifaces) and (open_metric is None or m < open_metric)
+        })
+    return cover
+
+
+def v6_prefix_match(addr, candidates, bits=64):
+    """Whether `addr` shares a /`bits` network with any of `candidates`.
+
+    Comparing the text would be wrong, because `::` stands for a variable
+    number of zero groups and so the first four colon-separated groups are
+    not the first 64 bits. `2001:db8::5` and `2001:db8::a1b2:c3d4:e5f6:7890`
+    are both inside 2001:db8::/64, but split on colons they part company at
+    the third group. Leading zeros do the same, `2001:0db8:1:1::5` and
+    `2001:db8:1:1::5` being one address written two ways.
+
+    Every address on the uplink is compared, not just the first: a link can
+    hold two global prefixes at once, through a router announcing two /64s
+    out of a /56 or a renumbering that has not finished, and an exit inside
+    the second one is the user's own address just as much as the first.
+
+    Returns None when no comparison could be made at all, so that an address
+    neither side could parse is reported as unknown rather than as clean.
+    """
+    compared = False
+    for other in candidates or []:
+        try:
+            net = ipaddress.ip_network("%s/%d" % (addr, bits), strict=False)
+            other_addr = ipaddress.ip_address(other)
+        except ValueError:
+            continue
+        compared = True
+        if other_addr in net:
+            return True
+    return False if compared else None
+
+
+def address_escape(r, family, tunnel):
+    """Where this family would go if sent from the uplink's own address.
+
+    This is the lookup that discriminates. A working policy-routed VPN sends
+    it down the tunnel, because the fwmark rule matches on the address, so an
+    answer outside the tunnel means the routing is genuinely broken and
+    ordinary traffic is at risk. A route landing on a sink is not an escape:
+    the packet is discarded here rather than sent.
+    """
+    dev = r.get("bypass%d" % family)
+    if dev and dev != tunnel and not r.get("bypass%dSink" % family):
+        return dev
+    return None
+
+
+def device_escape(r, family, tunnel):
+    """Where it would go if bound to the uplink interface by name.
+
+    Worth knowing and not worth a verdict. Forcing the output interface skips
+    the fwmark rule by construction, so this names the physical interface on
+    almost any policy-routed VPN, with or without a kill switch, and no VPN
+    setting changes it -- closing it takes a firewall rule. A row that is
+    amber for every user in every state is not a check, it is a decoration,
+    and it drowns the rows that do mean something. It is reported as a
+    sentence on the green verdict instead.
+    """
+    dev = r.get("bound%d" % family)
+    if dev and dev != tunnel and not r.get("bound%dSink" % family):
+        return dev
+    return None
+
+
+def sunk_route(r, family, tunnel):
+    """A device outside the tunnel that swallows this family instead."""
+    for key in ("bypass%d" % family, "bound%d" % family):
+        dev = r.get(key)
+        if dev and dev != tunnel and r.get(key + "Sink"):
+            return dev
+    return None
+
+
+def same_operator(a, b):
+    """Whether two geo answers describe one address, or one network.
+
+    The address comparison is the certain one, but it only ever fires within
+    a family. An IPv4 exit is never equal to the IPv6 address the ISP put on
+    the uplink, even though both belong to the same operator and finding the
+    second in front of the first is the leak worth naming. Matching the
+    autonomous system catches that, and is the same test the DNS leak check
+    already trusts.
+    """
+    if not a or not b:
+        return False
+    if a.get("ip") and a.get("ip") == b.get("ip"):
+        return True
+    return bool(a.get("asn")) and a.get("asn") == b.get("asn")
+
+
+def is_sink(dev, ifaces):
+    """Whether packets routed to `dev` are discarded rather than sent."""
+    rec = ifaces.get(dev) if dev else None
+    return bool(rec and rec["kind"] in SINK_KINDS)
+
+
+def is_global_v6(addr):
+    """Whether an IPv6 address is one the outside world could route to.
+
+    Link-local and unique-local addresses are neither an identity nor a leak,
+    and one VPN client's kill switch parks a ULA on a dummy interface, so both are
+    excluded before anything is inferred from what remains.
+    """
+    a = addr.lower()
+    if a.startswith("fe80:") or a.startswith("::"):
+        return False
+    # fc00::/7 -- unique local, RFC 4193.
+    if a.startswith("fc") or a.startswith("fd"):
+        return False
+    return ":" in a
+
+
+def classify_interfaces():
+    """Split the interfaces into the tunnel, the physical uplink, and noise."""
+    by_name = {}
+    for link in links():
+        name = link.get("ifname")
+        if not name:
+            continue
+        info = link.get("linkinfo") or {}
+        by_name[name] = {
+            "ifname": name,
+            "kind": info.get("info_kind"),
+            "operstate": link.get("operstate"),
+            "v4": [],
+            "v6": [],
+        }
+
+    for entry in addresses():
+        name = entry.get("ifname")
+        rec = by_name.get(name)
+        if not rec:
+            continue
+        for a in entry.get("addr_info") or []:
+            if a.get("family") == "inet":
+                rec["v4"].append(a.get("local"))
+            elif a.get("family") == "inet6" and is_global_v6(a.get("local") or ""):
+                rec["v6"].append(a.get("local"))
+
+    tunnel_like = set()
+    for name, rec in by_name.items():
+        if name == "lo" or rec["kind"] in NOT_A_TUNNEL_KINDS:
+            continue
+        if rec["kind"] in TUNNEL_KINDS or any(
+            name.startswith(h) for h in TUNNEL_NAME_HINTS
+        ):
+            tunnel_like.add(name)
+
+    # A tunnel with no address of its own is a leftover device, not a live
+    # connection.
+    candidates = [
+        name for name in by_name
+        if name in tunnel_like and (by_name[name]["v4"] or by_name[name]["v6"])
+    ]
+
+    # The tunnel is whichever candidate traffic actually leaves by. Taking the
+    # first in interface-index order instead would hand every routing and DNS
+    # verdict to a dormant Tailscale, tap or leftover wg device that happened
+    # to be created at boot, because `ip link show` lists in index order and
+    # NetworkManager rebuilds the real tunnel with a fresh, higher index on
+    # every connect. A candidate that carries nothing is still reported, as
+    # "up but unused", so falling back to the first one loses nothing.
+    tunnel = None
+    for dest in (PROBE_V4, PROBE_V6):
+        dev = route_get(dest)
+        if dev in candidates:
+            tunnel = dev
+            break
+    if tunnel is None and candidates:
+        tunnel = candidates[0]
+
+    # The physical uplink is whatever holds the lowest-metric default route in
+    # the main table, once tunnels and sinks are excluded. On a policy-routed
+    # VPN the main-table default is already the real one, but a VPN that puts
+    # its default in the main table instead -- NetworkManager's OpenVPN
+    # plugin, or wg-quick with Table=main -- would otherwise be named as the
+    # uplink, and then every address, ISP, real-IP and IPv6 judgement would be
+    # made against the tunnel's own addresses rather than against the ones it
+    # is supposed to be hiding.
+    phys = None
+    for family in (4, 6):
+        for dev, _metric in sorted(default_routes(family), key=lambda r: r[1]):
+            if (dev in by_name and dev != tunnel and dev not in tunnel_like
+                    and not is_sink(dev, by_name)):
+                phys = dev
+                break
+        if phys:
+            break
+
+    return by_name, tunnel, phys
+
+
+def nm_connections():
+    """Active NetworkManager connections, as (name, type, device) triples."""
+    out = run(["nmcli", "-t", "-f", "NAME,TYPE,DEVICE,STATE", "con", "show", "--active"])
+    if not out:
+        return []
+    rows = []
+    for line in out.splitlines():
+        # nmcli escapes literal colons as "\:" in terse output, so a naive
+        # split would tear apart a connection named "Example VPN NL\:12".
+        parts, buf, esc = [], "", False
+        for ch in line:
+            if esc:
+                buf += ch
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == ":":
+                parts.append(buf)
+                buf = ""
+            else:
+                buf += ch
+        parts.append(buf)
+        if len(parts) >= 4:
+            rows.append(tuple(parts[:4]))
+    return rows
+
+
+def dns_config():
+    """systemd-resolved's view of DNS, as structured data rather than prose."""
+    data = run_json(["resolvectl", "--json=short", "status"])
+    if not isinstance(data, list) or not data:
+        return None
+
+    globals_, per_link = {}, []
+    for entry in data:
+        if "ifname" not in entry:
+            globals_ = entry
+        else:
+            per_link.append(entry)
+
+    def servers_of(entry):
+        return [s.get("addressString") for s in entry.get("servers") or [] if s.get("addressString")]
+
+    links_out = []
+    for entry in per_link:
+        links_out.append(
+            {
+                "ifname": entry.get("ifname"),
+                "defaultRoute": bool(entry.get("defaultRoute")),
+                "servers": servers_of(entry),
+                "searchDomains": [
+                    d.get("domain") for d in entry.get("searchDomains") or [] if d.get("domain")
+                ],
+                "dnsOverTLS": entry.get("dnsOverTLS"),
+            }
+        )
+
+    return {
+        "resolvConfMode": globals_.get("resolvConfMode"),
+        "dnsOverTLS": globals_.get("dnsOverTLS"),
+        "dnssec": globals_.get("dnssec"),
+        "fallbackServers": [
+            s.get("addressString") for s in globals_.get("fallbackServers") or [] if s.get("addressString")
+        ],
+        "globalServers": servers_of(globals_),
+        "links": links_out,
+    }
+
+
+# ----------------------------------------------------------- network probes
+
+
+def https_get_json(host, path, family=socket.AF_INET, timeout=6.0):
+    """One JSON GET over TLS, pinned to an address family.
+
+    Written out longhand because the family has to be forced: asking for the
+    IPv4 answer and the IPv6 answer separately is the whole point, and
+    urllib offers no way to say which one it should use.
+    """
+    # `timeout` is the budget for the call, not for each address the name
+    # resolves to. ipinfo.io answers with several, and spending the full
+    # timeout on every one of them in turn is how a six-second lookup became a
+    # half-minute one.
+    deadline = time.monotonic() + timeout
+    err = None
+    for af, socktype, proto, _canon, sa in socket.getaddrinfo(
+        host, 443, family, socket.SOCK_STREAM
+    ):
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        sock = socket.socket(af, socktype, proto)
+        sock.settimeout(left)
+        try:
+            sock.connect(sa)
+            ctx = ssl.create_default_context()
+            tls = ctx.wrap_socket(sock, server_hostname=host)
+            tls.sendall(
+                (
+                    "GET %s HTTP/1.1\r\nHost: %s\r\n"
+                    "User-Agent: omarchy-vpn-check\r\nAccept: application/json\r\n"
+                    "Connection: close\r\n\r\n" % (path, host)
+                ).encode()
+            )
+            resp = http.client.HTTPResponse(tls, method="GET")
+            resp.begin()
+            body = resp.read()
+            status = resp.status
+            tls.close()
+            if status != 200:
+                raise OSError("HTTP %d" % status)
+            return json.loads(body.decode("utf-8", "replace"))
+        except Exception as exc:  # noqa: BLE001 - any failure means "unknown"
+            err = exc
+            try:
+                sock.close()
+            except OSError:
+                pass
+    raise err or OSError("no address for %s" % host)
+
+
+class DNSRcodeError(OSError):
+    """A reply that arrived but refused to answer: SERVFAIL, NXDOMAIN and so on.
+
+    Kept apart from a timeout because the two mean different things. A resolver
+    that returns SERVFAIL for a zone served only over IPv6 has answered the
+    question of whether it can reach IPv6 at all.
+    """
+
+    NAMES = {1: "FORMERR", 2: "SERVFAIL", 3: "NXDOMAIN", 4: "NOTIMP", 5: "REFUSED"}
+
+    def __init__(self, rcode):
+        self.rcode = rcode
+        super().__init__(self.NAMES.get(rcode, "rcode %d" % rcode))
+
+
+def dns_query(server, name, qtype, timeout=3.0):
+    """A single DNS query, answered as a list of strings.
+
+    Sent to whichever resolver the system is actually configured to use, so
+    that what comes back describes the real path rather than a hypothetical
+    one. Only A, AAAA and TXT are decoded, which is all this plugin asks for.
+    """
+    tid = random.randint(0, 0xFFFF)
+    header = struct.pack(">HHHHHH", tid, 0x0100, 1, 0, 0, 0)
+    qname = b"".join(bytes([len(p)]) + p.encode() for p in name.split(".")) + b"\x00"
+    packet = header + qname + struct.pack(">HH", qtype, 1)
+
+    family = socket.AF_INET6 if ":" in server else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    try:
+        sock.sendto(packet, (server, 53))
+        data, _ = sock.recvfrom(4096)
+    finally:
+        sock.close()
+
+    if len(data) < 12 or struct.unpack(">H", data[:2])[0] != tid:
+        raise OSError("mismatched DNS reply")
+    rcode = data[3] & 0x0F
+    if rcode:
+        raise DNSRcodeError(rcode)
+
+    i = 12
+    while data[i]:
+        i += data[i] + 1
+    i += 5  # terminating zero, plus qtype and qclass
+
+    answers = []
+    for _ in range(struct.unpack(">H", data[6:8])[0]):
+        if data[i] & 0xC0 == 0xC0:
+            i += 2
+        else:
+            while data[i]:
+                i += data[i] + 1
+            i += 1
+        rtype, _rclass, _ttl, rdlen = struct.unpack(">HHIH", data[i : i + 10])
+        i += 10
+        rdata = data[i : i + rdlen]
+        i += rdlen
+        if rtype == 1 and rdlen == 4:
+            answers.append(socket.inet_ntoa(rdata))
+        elif rtype == 28 and rdlen == 16:
+            answers.append(socket.inet_ntop(socket.AF_INET6, rdata))
+        elif rtype == 16 and rdlen:
+            answers.append(rdata[1 : 1 + rdata[0]].decode("utf-8", "replace"))
+    return answers
+
+
+def resolver_egress(timeout=3.0):
+    """The public IPv4 address the recursive resolver queries the internet from.
+
+    This is the number that reveals a DNS leak. It is not the address of the
+    resolver we talk to -- that is usually a private one inside the tunnel --
+    but the address the world sees when that resolver goes and asks.
+
+    Every probe here is answered by nameservers the resolver may reach over
+    IPv4, so the answer describes the IPv4 path. A resolver can leave by a
+    different address, in a different country, when it asks over IPv6, and
+    `resolver_egress6` asks that separately.
+    """
+    seen, errors = [], []
+    probes = (
+        ("whoami.v4.powerdns.org", 16),
+        ("o-o.myaddr.l.google.com", 16),
+        ("whoami.akamai.net", 1),
+    )
+    for name, qtype in probes:
+        try:
+            for value in dns_query("127.0.0.53", name, qtype, timeout):
+                if value not in seen:
+                    seen.append(value)
+        except Exception as exc:  # noqa: BLE001
+            errors.append("%s: %s" % (name, exc))
+    return seen, errors
+
+
+def resolver_egress6(timeout=3.0):
+    """The public IPv6 address the resolver queries from, or why there is none.
+
+    PowerDNS serves `whoami.v6.powerdns.org` from nameservers that have only
+    IPv6 addresses, so the resolver has to use IPv6 to answer it and the TXT
+    record names the address it used. A SERVFAIL means the resolver has no
+    working IPv6 path, which is a finding rather than an error.
+
+    Returns (addresses, state), where state is "found", "no-ipv6" or "unknown".
+    """
+    try:
+        found = [v for v in dns_query("127.0.0.53", "whoami.v6.powerdns.org", 16, timeout)
+                 if ":" in v]
+    except DNSRcodeError as exc:
+        return [], "no-ipv6" if exc.rcode == 2 else "unknown"
+    return (found, "found") if found else ([], "unknown")
+
+
+def geo(ip=None, family=socket.AF_INET, token=None, timeout=6.0):
+    """Ownership and rough location of an address, cached on disk by address.
+
+    With no address it describes this connection as the internet sees it,
+    which is the only call that has to go out live every time.
+    """
+    if ip:
+        cached = cache_read("geo/%s.json" % ip.replace(":", "_"), GEO_TTL_SECONDS)
+        if cached:
+            return cached
+
+    path = "/%s/json" % ip if ip else "/json"
+    if token:
+        path += "?token=%s" % token
+    # ipinfo.io itself has no IPv6 address, so asking it over IPv6 always
+    # fails and used to be read as IPv6 being blocked. Its v6 host answers the
+    # same API over IPv6 only. A lookup about a named address needs no
+    # particular family, so only the self-lookup switches host.
+    host = "v6.ipinfo.io" if family == socket.AF_INET6 and not ip else "ipinfo.io"
+    raw = https_get_json(host, path, family=family, timeout=timeout)
+
+    org = raw.get("org") or ""
+    asn, org_name = "", org
+    if org.startswith("AS"):
+        parts = org.split(" ", 1)
+        asn = parts[0]
+        org_name = parts[1] if len(parts) > 1 else ""
+
+    out = {
+        "ip": raw.get("ip"),
+        "hostname": raw.get("hostname"),
+        "asn": asn,
+        "org": org_name,
+        "city": raw.get("city"),
+        "region": raw.get("region"),
+        "country": raw.get("country"),
+    }
+    if out["ip"]:
+        cache_write("geo/%s.json" % out["ip"].replace(":", "_"), out)
+    return out
+
+
+COUNTRY_NAMES_PATH = "/usr/share/iso-codes/json/iso_3166-1.json"
+
+# Enough of ISO 3166 to name the countries a VPN exit is plausibly in, used
+# only when the iso-codes package is absent. Anything unlisted falls back to
+# its two-letter code, which is still readable.
+COUNTRY_FALLBACK = {
+    "AT": "Austria", "AU": "Australia", "BE": "Belgium", "BR": "Brazil",
+    "CA": "Canada", "CH": "Switzerland", "CZ": "Czechia", "DE": "Germany",
+    "DK": "Denmark", "ES": "Spain", "FI": "Finland", "FR": "France",
+    "GB": "United Kingdom", "HK": "Hong Kong", "IE": "Ireland", "IL": "Israel",
+    "IN": "India", "IS": "Iceland", "IT": "Italy", "JP": "Japan",
+    "NL": "Netherlands", "NO": "Norway", "NZ": "New Zealand", "PL": "Poland",
+    "PT": "Portugal", "RO": "Romania", "SE": "Sweden", "SG": "Singapore",
+    "UA": "Ukraine", "US": "United States", "ZA": "South Africa",
+}
+
+
+def country_names():
+    try:
+        with open(COUNTRY_NAMES_PATH) as fh:
+            data = json.load(fh)
+        return {c["alpha_2"]: c["name"] for c in data["3166-1"] if c.get("alpha_2")}
+    except (OSError, ValueError, KeyError):
+        return dict(COUNTRY_FALLBACK)
+
+
+def place(g, names):
+    """A geo record rendered as somewhere a person recognises."""
+    if not g:
+        return ""
+    code = g.get("country") or ""
+    country = names.get(code, code)
+    city = g.get("city") or ""
+    if city and country:
+        return "%s, %s" % (city, country)
+    return country or city or ""
+
+
+def holder(g):
+    """Who runs the address: the operator, with its AS number when known."""
+    if not g:
+        return ""
+    org, asn = g.get("org") or "", g.get("asn") or ""
+    if org and asn:
+        return "%s (%s)" % (org, asn)
+    return org or asn or ""
+
+
+def check(cid, label, value, status, detail=""):
+    return {
+        "id": cid,
+        "label": label,
+        "value": value or "—",
+        "status": status,  # ok | warn | bad | unknown
+        "detail": detail,
+    }
+
+
+WORST = {"unknown": 0, "ok": 1, "warn": 2, "bad": 3}
+
+
+def worst_of(checks):
+    ranked = sorted(checks, key=lambda c: WORST.get(c["status"], 0))
+    return ranked[-1]["status"] if ranked else "unknown"
+
+
+# ------------------------------------------------------------------ snapshot
+
+
+def gather_network(phys_v6, token, timeout):
+    """Every outbound lookup, run at once and finished by one deadline.
+
+    All of it leaves through whatever the default route is, so while a tunnel
+    is up these queries are inside it. Nothing here is bound to a specific
+    interface, because binding past the tunnel is precisely the mistake this
+    plugin exists to detect.
+
+    The deadline is shared rather than granted per job. Waiting `timeout` on
+    each of four jobs in turn, and then again on the resolver lookup that
+    follows them, adds up to five times the number the panel was given, and
+    the panel spends all of it showing "checking". One deadline for the whole
+    function means a tunnel that has just dropped costs one timeout, and
+    whatever answers arrived before it are reported.
+    """
+    out = empty_network()
+    deadline = time.monotonic() + timeout + 2
+
+    def remaining():
+        return max(0.0, deadline - time.monotonic())
+
+    pool = futures.ThreadPoolExecutor(max_workers=5)
+    try:
+        jobs = {
+            "exit4": pool.submit(geo, None, socket.AF_INET, token, timeout),
+            "exit6": pool.submit(geo, None, socket.AF_INET6, token, timeout),
+            "egress": pool.submit(resolver_egress, min(timeout, 4.0)),
+            "egress6": pool.submit(resolver_egress6, min(timeout, 4.0)),
+        }
+        # The ISP that owns the physical link is read from an address it has
+        # already handed us, so this is a lookup about an address rather than
+        # a connection made from it. Nothing is sent outside the tunnel.
+        if phys_v6:
+            jobs["isp"] = pool.submit(geo, phys_v6, socket.AF_INET, token, timeout)
+
+        for key, job in jobs.items():
+            try:
+                result = job.result(timeout=remaining())
+            except Exception as exc:  # noqa: BLE001
+                # An IPv6 lookup that fails is a finding, not an error: it is
+                # what a working kill switch looks like from in here.
+                if key != "exit6":
+                    out["errors"].append("%s: %s" % (key, exc))
+                continue
+            if key == "egress":
+                seen, errs = result
+                out["egress"] = seen
+                out["errors"].extend(errs)
+            elif key == "egress6":
+                out["egress6"], out["egress6State"] = result
+            else:
+                out[key] = result
+    finally:
+        # Deliberately without waiting. A worker blocked in getaddrinfo on a
+        # resolver down a dead tunnel cannot be cancelled or interrupted, and
+        # joining it here is exactly what turned a bounded timeout back into
+        # an unbounded one.
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    for addrs, key in ((out["egress"], "egressGeo"), (out["egress6"], "egressGeo6")):
+        if addrs and remaining() > 0:
+            try:
+                out[key] = geo(addrs[0], socket.AF_INET, token, min(timeout, remaining()))
+            except Exception as exc:  # noqa: BLE001
+                out["errors"].append("%s: %s" % (key, exc))
+
+    return out
+
+
+def empty_network():
+    """The network half of a snapshot before, or without, any lookup."""
+    return {"exit4": None, "exit6": None, "egress": [], "egressGeo": None,
+            "egress6": [], "egress6State": "unknown", "egressGeo6": None,
+            "isp": None, "errors": []}
+
+
+def snapshot(local_only=False, token=None, timeout=6.0):
+    names = country_names()
+    ifaces, tunnel, phys = classify_interfaces()
+    tun = ifaces.get(tunnel) if tunnel else None
+    ph = ifaces.get(phys) if phys else None
+    dns = dns_config()
+
+    if dns:
+        # Which interface each active resolver is reached through, asked of the
+        # routing table rather than by sending anything. A resolver that can
+        # only be reached down the tunnel cannot be overheard outside it.
+        routes = {}
+        for link in dns["links"]:
+            if not (link["defaultRoute"] and link["servers"]):
+                continue
+            for server in link["servers"]:
+                routes[server] = route_get(server)
+        dns["serverRoutes"] = routes
+        dns["resolversInTunnel"] = bool(routes) and all(
+            dev == tunnel for dev in routes.values()
+        )
+
+    conn_name, conn_by_device = "", {}
+    for name, ctype, device, _state in nm_connections():
+        if tunnel and device == tunnel:
+            conn_name = name
+        if device:
+            conn_by_device[device] = name
+
+    # Named after whatever holds each guard up, so the row can say which one,
+    # but decided by the routing table rather than by the name.
+    cover = kill_switch_cover(ifaces, tunnel)
+    kill_switch = {
+        "v4": [conn_by_device.get(dev, dev) for dev in cover[4]],
+        "v6": [conn_by_device.get(dev, dev) for dev in cover[6]],
+    }
+
+    default4 = route_get(PROBE_V4)
+    default6 = route_get(PROBE_V6)
+    phys_v4 = ph["v4"][0] if ph and ph["v4"] else None
+    phys_v6 = ph["v6"][0] if ph and ph["v6"] else None
+    # Where a packet would go if something asked to send it from the physical
+    # interface's own address -- the shape a badly-behaved application takes.
+    bypass4 = route_get(PROBE_V4, phys_v4) if phys_v4 else None
+    bypass6 = route_get(PROBE_V6, phys_v6) if phys_v6 else None
+    # And where it would go if something bound to the interface rather than to
+    # the address. This is a different lookup with a different answer, and it
+    # needs no privilege: an ordinary process may set SO_BINDTODEVICE and walk
+    # straight past a fwmark rule that only ever matched the address.
+    bound4 = route_get(PROBE_V4, oif=phys) if phys else None
+    bound6 = route_get(PROBE_V6, oif=phys) if phys else None
+
+    # A tunnel that is not carrying traffic is only an exposure if the traffic
+    # goes somewhere. When the kill switch is holding, the default route it
+    # parked outbids the open connection and every packet is discarded on this
+    # machine instead: the VPN has failed and nothing is reaching the internet,
+    # which is a state to act on rather than a leak to panic about.
+    def contained(dev):
+        return dev is None or dev == tunnel or is_sink(dev, ifaces)
+
+    carrying = bool(tunnel) and default4 == tunnel
+    blocked = not carrying and contained(default4) and contained(default6)
+
+    net = empty_network()
+    if not local_only:
+        net = gather_network(phys_v6, token, timeout)
+
+    # The real address, from the best source available. Observed live with no
+    # tunnel up is the only one that is certain; the cache is that same
+    # observation remembered; the ISP prefix identifies the operator and
+    # country but not the address itself.
+    real = None
+    if not tunnel and net["exit4"] and net["exit4"].get("ip"):
+        real = dict(net["exit4"])
+        real["source"] = "live"
+        real["observedAt"] = time.time()
+        cache_write("real-ip.json", real)
+    else:
+        cached = cache_read("real-ip.json")
+        if cached:
+            real = dict(cached)
+            real["source"] = "cache"
+            real["observedAt"] = cached.get("_cachedAt")
+        elif net["isp"] and net["isp"].get("ip") == phys_v6:
+            # No IPv4 has ever been observed without a tunnel, but the ISP has
+            # already put a globally routable IPv6 address on the physical
+            # interface. That address is genuinely theirs and genuinely
+            # identifies them, so it is a real answer rather than a stand-in.
+            real = dict(net["isp"])
+            real["source"] = "local-ipv6"
+
+    isp = net["isp"] or (real if real else None)
+
+    return {
+        "generatedAt": time.time(),
+        "mode": "local" if local_only else "full",
+        "names": names,
+        "tunnel": {
+            "iface": tunnel,
+            "kind": tun["kind"] if tun else None,
+            "connection": conn_name,
+            "v4": tun["v4"] if tun else [],
+            "v6": tun["v6"] if tun else [],
+        },
+        # `v6All` is every global address the uplink holds; `v6` is the one
+        # used for lookups and for display. A link with two prefixes needs the
+        # list, because an exit inside either of them is the user's own.
+        "phys": {"iface": phys, "v4": phys_v4, "v6": phys_v6,
+                 "v6All": list(ph["v6"]) if ph else []},
+        "routing": {"default4": default4, "default6": default6,
+                    "bypass4": bypass4, "bypass6": bypass6,
+                    "bound4": bound4, "bound6": bound6,
+                    "default4Sink": is_sink(default4, ifaces),
+                    "default6Sink": is_sink(default6, ifaces),
+                    "bypass4Sink": is_sink(bypass4, ifaces),
+                    "bypass6Sink": is_sink(bypass6, ifaces),
+                    "bound4Sink": is_sink(bound4, ifaces),
+                    "bound6Sink": is_sink(bound6, ifaces),
+                    "blocked": blocked},
+        "killSwitch": kill_switch,
+        "dns": dns,
+        "net": net,
+        "real": real,
+        "isp": isp,
+    }
+
+
+# -------------------------------------------------------------------- checks
+
+
+def build_checks(s):
+    names = s["names"]
+    t, r, ph = s["tunnel"], s["routing"], s["phys"]
+    net, dns = s["net"], s["dns"]
+    exit4, egress_geo = net["exit4"], net["egressGeo"]
+    real, isp = s["real"], s["isp"]
+    tunnel = t["iface"]
+    local = s["mode"] == "local"
+    unknown_detail = ("Network checks were skipped" if local
+                      else "Nothing can reach the internet while the kill switch is holding"
+                      if s["routing"]["blocked"] else "No answer from the lookup")
+    out = []
+
+    def add(section, *a, **kw):
+        c = check(*a, **kw)
+        c["section"] = section
+        out.append(c)
+
+    # ---- Connection
+    held = "The kill switch is holding, so nothing is reaching the internet. " \
+           "Reconnect the VPN to get back online"
+    if not tunnel:
+        if r["blocked"]:
+            add("Connection", "tunnel", "Tunnel", "Not connected", "warn", held)
+        else:
+            add("Connection", "tunnel", "Tunnel", "Not connected", "bad",
+                "No VPN interface is carrying traffic")
+    elif r["default4"] != tunnel:
+        if r["blocked"]:
+            add("Connection", "tunnel", "Tunnel", "%s, not carrying" % tunnel, "warn", held)
+        else:
+            add("Connection", "tunnel", "Tunnel", "%s, unused" % tunnel, "bad",
+                "The interface is up but traffic is leaving via %s"
+                % (r["default4"] or "another route"))
+    else:
+        kind = {"wireguard": "WireGuard"}.get(t["kind"] or "", (t["kind"] or "tunnel").upper())
+        add("Connection", "tunnel", "Tunnel", "%s, %s" % (tunnel, kind), "ok",
+            t["connection"] or "")
+
+    if r["blocked"]:
+        add("Connection", "routing", "Traffic routing", "Blocked", "warn",
+            "Traffic is being discarded by %s rather than sent outside the tunnel"
+            % (r["default4"] or "the kill switch"))
+    elif not tunnel:
+        add("Connection", "routing", "Traffic routing", "Direct to the internet", "bad",
+            "Everything is leaving via %s" % (r["default4"] or "the physical link"))
+    elif address_escape(r, 4, tunnel):
+        add("Connection", "routing", "Traffic routing", "Bypass available", "bad",
+            "Traffic sent from %s would leave via %s, outside the tunnel"
+            % (ph["v4"] or ph["iface"], address_escape(r, 4, tunnel)))
+    else:
+        bound = device_escape(r, 4, tunnel) or device_escape(r, 6, tunnel)
+        # Naming only IPv4 when the tunnel also holds the IPv6 default reads as
+        # if IPv6 were going somewhere else.
+        carried = "IPv4 and IPv6" if r["default6"] == tunnel else "IPv4"
+        add("Connection", "routing", "Traffic routing", "%s via %s" % (carried, tunnel), "ok",
+            "Traffic sent from the physical address stays inside the tunnel. Only a "
+            "program that names %s as its interface could go around it, which takes "
+            "a firewall rule to prevent on any VPN" % ph["iface"] if bound else
+            "Neither the physical address nor the interface itself escapes the tunnel")
+
+    # A family with no address on the uplink has nothing to fall back to, so
+    # it needs no guard and its absence is not a gap.
+    ks = s["killSwitch"]
+    families = [("v4", "IPv4"), ("v6", "IPv6")]
+    needed = [(key, label) for key, label in families if ph[key]]
+    held = [(key, label) for key, label in needed if ks[key]]
+    exposed = [(key, label) for key, label in needed if not ks[key]]
+    guards = ", ".join(sorted({name for key, _ in held for name in ks[key]}))
+    fallback = ph["iface"] or "the open connection"
+    if held and not exposed:
+        add("Connection", "killswitch", "Kill switch", "Active", "ok", guards)
+    elif held:
+        add("Connection", "killswitch", "Kill switch",
+            "%s only" % " and ".join(label for _, label in held), "warn",
+            "%s is held by %s, but %s would fall back to %s if the tunnel drops"
+            % (" and ".join(label for _, label in held), guards,
+               " and ".join(label for _, label in exposed), fallback))
+    else:
+        add("Connection", "killswitch", "Kill switch", "Not detected", "warn",
+            "Traffic may fall back to %s if the tunnel drops" % fallback)
+
+    # ---- Exit
+    exit_ip = (exit4 or {}).get("ip")
+    real_ip = (real or {}).get("ip")
+    # The plain address comparison only ever fires when the recorded real
+    # address is an IPv4 one. When it was taken from the uplink's IPv6 it
+    # cannot equal an IPv4 exit however badly the tunnel is failing, so the
+    # operator is compared too and the row says which of the two it matched.
+    exposed = same_operator(exit4, real)
+    same_address = bool(exit_ip and real_ip and exit_ip == real_ip)
+    if not exit_ip:
+        add("Exit", "exit-ip", "External IP", "Unknown", "unknown", unknown_detail)
+    elif same_address:
+        add("Exit", "exit-ip", "External IP", exit_ip, "bad",
+            "This is your own address. The VPN is not carrying your traffic")
+    elif exposed:
+        add("Exit", "exit-ip", "External IP", exit_ip, "bad",
+            "This address belongs to %s, the network you connect from. The VPN "
+            "is not carrying your traffic" % (holder(real) or "your own ISP"))
+    elif not tunnel:
+        add("Exit", "exit-ip", "External IP", exit_ip, "bad",
+            "Your own address, with no tunnel in front of it")
+    else:
+        add("Exit", "exit-ip", "External IP", exit_ip, "ok",
+            (exit4 or {}).get("hostname") or "")
+
+    host = holder(exit4)
+    if not host:
+        add("Exit", "exit-host", "Hosted by", host, "unknown")
+    elif exposed:
+        add("Exit", "exit-host", "Hosted by", host, "bad",
+            "This is the network you connect from, not a VPN host")
+    else:
+        add("Exit", "exit-host", "Hosted by", host, "ok" if tunnel else "warn",
+            "" if tunnel else "This is your ISP, not a VPN host")
+
+    where = place(exit4, names)
+    add("Exit", "exit-location", "Exit location", where,
+        "unknown" if not where else "ok")
+
+    # ---- Identity
+    if real_ip:
+        when = real.get("observedAt")
+        stamp = time.strftime("%-d %b %Y, %H:%M", time.localtime(when)) if when else ""
+        source = {
+            "live": "Observed now, with no tunnel up",
+            "cache": "Last seen without a tunnel on %s" % stamp,
+            "local-ipv6": "The IPv6 address your ISP assigned to %s. Your IPv4 address "
+                          "is recorded the first time this panel opens with the VPN off"
+                          % (ph["iface"] or "your uplink"),
+        }.get(real.get("source"), "")
+        status = "bad" if exposed else "ok"
+        add("Identity", "real-ip", "Your real IP", real_ip, status, source)
+    else:
+        add("Identity", "real-ip", "Your real IP", "Not recorded", "warn",
+            "Open this panel once with the VPN off and it will be remembered")
+
+    isp_text = holder(isp)
+    isp_where = place(isp, names)
+    if isp_text or isp_where:
+        add("Identity", "isp", "Your ISP", isp_text or isp_where, "ok",
+            isp_where if isp_text else "")
+    else:
+        add("Identity", "isp", "Your ISP", "Unknown", "unknown", unknown_detail)
+
+    # ---- DNS
+    if not dns:
+        add("DNS", "dns-servers", "Resolvers", "Unknown", "unknown",
+            "systemd-resolved did not answer")
+        leaking_links = []
+    else:
+        # A link that both carries a default DNS route and has servers of its
+        # own is a link that can answer any query. Any such link other than
+        # the tunnel is a path queries can take around it.
+        routing_links = [l for l in dns["links"] if l["defaultRoute"] and l["servers"]]
+        leaking_links = [l for l in routing_links if l["ifname"] != tunnel]
+        if leaking_links and r["blocked"]:
+            add("DNS", "dns-servers", "Resolvers", "Split across interfaces", "warn",
+                "%s; none of them can be reached while the kill switch is holding"
+                % "; ".join("%s via %s" % (", ".join(l["servers"]), l["ifname"])
+                            for l in leaking_links))
+        elif leaking_links:
+            add("DNS", "dns-servers", "Resolvers", "Split across interfaces", "bad",
+                "; ".join("%s via %s" % (", ".join(l["servers"]), l["ifname"]) for l in leaking_links))
+        elif routing_links:
+            l = routing_links[0]
+            add("DNS", "dns-servers", "Resolvers", "%s via %s" % (", ".join(l["servers"]), l["ifname"]),
+                "ok", "No other interface can answer a query")
+        else:
+            add("DNS", "dns-servers", "Resolvers", "None configured", "warn",
+                "Queries will fall back to %s" % (", ".join(dns["fallbackServers"][:2]) or "built-in servers"))
+
+    # The resolver can ask over IPv4 and over IPv6 from different addresses,
+    # and those need not be in the same country. Checking only one family is
+    # how the panel once said Switzerland while ipleak.net said New York.
+    egress6, egress_geo6 = net["egress6"], net["egressGeo6"]
+    egress_addrs = [a for a in (net["egress"][:1] + egress6[:1]) if a]
+    if egress_addrs:
+        if egress6:
+            detail = "The addresses the internet sees your resolver use, over IPv4 and IPv6"
+        elif net["egress6State"] == "no-ipv6":
+            detail = ("The address the internet sees your resolver use. It has no "
+                      "working IPv6 path, so every query leaves over IPv4")
+        else:
+            detail = "The address the internet sees your resolver use over IPv4"
+        add("DNS", "dns-egress", "Queries come from", ", ".join(egress_addrs), "ok", detail)
+    else:
+        add("DNS", "dns-egress", "Queries come from", "Unknown", "unknown", unknown_detail)
+
+    add("DNS", *dns_location_check(egress_geo, egress_geo6, exit4, names, unknown_detail))
+
+    add("DNS", *worst_leak(
+        dns_leak_check(g, exit4, isp, names, tunnel, leaking_links, local, r["blocked"])
+        for g in ([egress_geo, egress_geo6] if egress_geo6 else [egress_geo])))
+
+    if dns:
+        tls = str(dns.get("dnsOverTLS") or "no").lower()
+        if tls == "yes":
+            add("DNS", "dns-tls", "DNS encryption", "DNS over TLS", "ok", "")
+        elif tunnel and dns.get("resolversInTunnel"):
+            # Plaintext here is not a weakness. The queries never leave the
+            # tunnel, and the resolver at the far end belongs to the VPN, so
+            # encrypting to it would encrypt to the party already reading it.
+            add("DNS", "dns-tls", "DNS encryption", "Not needed", "ok",
+                "Queries are plaintext but never leave the tunnel, and the resolver "
+                "is the VPN's own")
+        elif tls == "opportunistic":
+            # Opportunistic mode encrypts when the resolver offers it and sends
+            # cleartext when it does not, without saying which happened. A
+            # network that blocks port 853 turns it off silently, which is the
+            # network where it mattered.
+            add("DNS", "dns-tls", "DNS encryption", "Opportunistic", "warn",
+                "Encrypted only if the resolver offers it, and silently plaintext "
+                "if it does not")
+        else:
+            add("DNS", "dns-tls", "DNS encryption", "Off", "warn",
+                "Queries leave in plaintext over a network you do not control")
+
+    # ---- IPv6
+    add("IPv6", *ipv6_check(s, names))
+    return out
+
+
+def dns_location_check(geo4, geo6, exit4, names, unknown_detail):
+    """Where lookups surface, per family, measured against the exit country.
+
+    This is not the leak check. A resolver run by the VPN operator in another
+    country leaks nothing to the ISP, but a site that picks a server by where
+    the lookup came from will place you there instead of at the exit, which
+    is worth an amber row when the point of choosing a country was to appear
+    in it.
+    """
+    geos = [(label, g) for label, g in (("IPv4", geo4), ("IPv6", geo6)) if g]
+    if not geos:
+        return ("dns-location", "DNS resolves from", "Unknown", "unknown", unknown_detail)
+
+    if len({place(g, names) for _, g in geos}) == 1:
+        value = place(geos[0][1], names) or holder(geos[0][1])
+    else:
+        value = " and ".join("%s (%s)" % (place(g, names) or holder(g), label)
+                             for label, g in geos)
+
+    exit_country = (exit4 or {}).get("country")
+    elsewhere = [label for label, g in geos
+                 if exit_country and g.get("country") and g.get("country") != exit_country]
+    if not elsewhere:
+        return ("dns-location", "DNS resolves from", value, "ok", holder(geos[0][1]))
+    return ("dns-location", "DNS resolves from", value, "warn",
+            "%s lookups surface outside %s, where your traffic exits. Sites that "
+            "choose a server by resolver location may place you there instead. "
+            "Connecting to a different server usually changes this"
+            % (" and ".join(elsewhere), names.get(exit_country, exit_country)))
+
+
+def worst_leak(verdicts):
+    """The most serious of several leak verdicts, one per address family."""
+    return max(verdicts, key=lambda v: WORST.get(v[3], 0))
+
+
+def dns_leak_check(egress_geo, exit4, isp, names, tunnel, leaking_links, local,
+                   blocked=False):
+    """Whether DNS queries are surfacing somewhere other than the exit.
+
+    The comparison that matters is between who owns the resolver's egress
+    address and who owns the VPN exit. Matching operators is the clean case.
+    Matching the ISP instead is the leak, and is worth stating plainly.
+    """
+    if blocked:
+        return ("dns-leak", "DNS leak", "Blocked", "warn",
+                "No query can reach the internet while the kill switch is holding")
+    if leaking_links:
+        return ("dns-leak", "DNS leak", "Leaking", "bad",
+                "An interface outside the tunnel can answer DNS queries")
+    if not egress_geo:
+        return ("dns-leak", "DNS leak", "Unknown", "unknown",
+                "Network checks were skipped" if local else "Could not identify the resolver")
+    if not tunnel:
+        return ("dns-leak", "DNS leak", "No tunnel", "bad",
+                "There is nothing for DNS to leak out of")
+
+    e_asn, e_country = egress_geo.get("asn"), egress_geo.get("country")
+    x_asn, x_country = (exit4 or {}).get("asn"), (exit4 or {}).get("country")
+    i_asn, i_country = (isp or {}).get("asn"), (isp or {}).get("country")
+
+    if i_asn and e_asn and e_asn == i_asn:
+        return ("dns-leak", "DNS leak", "Leaking to your ISP", "bad",
+                "Queries are surfacing on %s" % holder(egress_geo))
+    if x_asn and e_asn and e_asn == x_asn:
+        return ("dns-leak", "DNS leak", "None", "ok",
+                "Resolver and exit are the same operator")
+    if x_country and e_country and e_country == x_country:
+        return ("dns-leak", "DNS leak", "None", "ok",
+                "Resolver and exit are both in %s" % names.get(x_country, x_country))
+    if i_country and e_country and e_country == i_country:
+        return ("dns-leak", "DNS leak", "Queries surface at home", "bad",
+                "The resolver is in %s while the exit is in %s"
+                % (names.get(e_country, e_country), names.get(x_country, x_country)))
+    return ("dns-leak", "DNS leak", "Third country", "warn",
+            "The resolver is in %s while the exit is in %s"
+            % (names.get(e_country, e_country), names.get(x_country, x_country)))
+
+
+def ipv6_check(s, names):
+    """IPv6 is either carried, blocked, or the quietest way to be identified."""
+    t, r, ph, net = s["tunnel"], s["routing"], s["phys"], s["net"]
+    tunnel = t["iface"]
+    exit6 = net["exit6"]
+
+    if not ph["v6"]:
+        return ("ipv6", "IPv6", "Not in use", "ok",
+                "The physical link has no globally routable IPv6 address")
+    if tunnel:
+        # A route out of the tunnel is only a leak if it goes anywhere. Landing
+        # on a sink means the packet is dropped on this machine.
+        escape = address_escape(r, 6, tunnel)
+        if escape:
+            return ("ipv6", "IPv6", "Leaking", "bad",
+                    "IPv6 sent from %s would leave via %s, outside the tunnel"
+                    % (ph["v6"], escape))
+        sunk = sunk_route(r, 6, tunnel)
+        if sunk:
+            if r["default6Sink"] or r["default6"] == tunnel:
+                return ("ipv6", "IPv6", "Blocked", "ok",
+                        "IPv6 from %s is discarded by %s rather than leaving "
+                        "beside the tunnel" % (ph["v6"], sunk))
+            return ("ipv6", "IPv6", "Leaking", "bad",
+                    "%s discards IPv6 bound to %s, but everything else still "
+                    "leaves via %s" % (sunk, ph["v6"], r["default6"]))
+    if exit6 and exit6.get("ip"):
+        # An exit address sharing one of the uplink's prefixes means the tunnel
+        # is being bypassed even though the routing table said otherwise.
+        match = v6_prefix_match(exit6["ip"], ph["v6All"])
+        if match:
+            return ("ipv6", "IPv6", "Leaking", "bad",
+                    "The internet sees %s, your own address" % exit6["ip"])
+        if match is None:
+            return ("ipv6", "IPv6", "Unverified", "warn",
+                    "The exit address %s could not be compared with the ones on "
+                    "your uplink" % exit6["ip"])
+        return ("ipv6", "IPv6", "Carried by the tunnel", "ok",
+                "The internet sees %s, in %s. Your ISP address %s is not used"
+                % (exit6["ip"], place(exit6, names) or holder(exit6), ph["v6"]))
+    if s["mode"] == "local":
+        return ("ipv6", "IPv6", "Not tested", "unknown", "Network checks were skipped")
+    if tunnel and r["default6"] == tunnel:
+        # The tunnel holds the IPv6 default, so a failed lookup means the
+        # lookup failed, not that IPv6 is blocked. Saying "Blocked" here is
+        # the mistake that hid a working IPv6 path behind a green row.
+        return ("ipv6", "IPv6", "Unverified", "unknown",
+                "IPv6 is routed into %s, but the lookup of its exit address did "
+                "not answer" % tunnel)
+    return ("ipv6", "IPv6", "Blocked", "ok",
+            "Your ISP address %s exists but cannot reach the internet" % ph["v6"])
+
+
+# --------------------------------------------------------------------- main
+
+
+HEADLINES = {
+    "ok": "Protected",
+    "warn": "Working, with caveats",
+    "bad": "Exposed",
+    "unknown": "Unknown",
+}
+
+
+def report(local_only=False, token=None, timeout=6.0):
+    s = snapshot(local_only, token, timeout)
+    checks = build_checks(s)
+    overall = worst_of([c for c in checks if c["status"] != "unknown"]) or "unknown"
+
+    headline = HEADLINES.get(overall, "Unknown")
+    if s["routing"]["blocked"]:
+        headline = "VPN down, traffic blocked"
+    elif not s["tunnel"]["iface"]:
+        headline = "No VPN"
+
+    exit4 = s["net"]["exit4"]
+    summary_bits = [b for b in (holder(exit4), place(exit4, s["names"])) if b]
+
+    sections, seen = [], set()
+    for c in checks:
+        if c["section"] not in seen:
+            seen.add(c["section"])
+            sections.append(c["section"])
+
+    return {
+        "generatedAt": s["generatedAt"],
+        "mode": s["mode"],
+        "overall": overall,
+        "headline": headline,
+        "exitIp": (exit4 or {}).get("ip") or "",
+        "summary": " — ".join(summary_bits),
+        "sections": sections,
+        "checks": checks,
+        "errors": s["net"]["errors"],
+    }
+
+
+DOTS = {"ok": "\033[32m●\033[0m", "warn": "\033[33m●\033[0m",
+        "bad": "\033[31m●\033[0m", "unknown": "\033[90m●\033[0m"}
+
+
+def print_text(rep):
+    print("%s  %s" % (DOTS.get(rep["overall"], "?"), rep["headline"]))
+    if rep["exitIp"]:
+        print("   %s  %s" % (rep["exitIp"], rep["summary"]))
+    for section in rep["sections"]:
+        print("\n%s" % section.upper())
+        for c in rep["checks"]:
+            if c["section"] != section:
+                continue
+            print("  %s %-18s %s" % (DOTS.get(c["status"], "?"), c["label"], c["value"]))
+            if c["detail"]:
+                print("     %s" % c["detail"])
+    for err in rep["errors"]:
+        print("\n! %s" % err, file=sys.stderr)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Report VPN and DNS posture as JSON.")
+    ap.add_argument("--local", action="store_true",
+                    help="skip every outbound lookup; report only what the machine knows")
+    ap.add_argument("--text", action="store_true", help="human-readable output")
+    ap.add_argument("--pretty", action="store_true", help="indent the JSON")
+    ap.add_argument("--timeout", type=float, default=6.0, help="per-lookup timeout in seconds")
+    ap.add_argument("--token", default=os.environ.get("IPINFO_TOKEN"),
+                    help="ipinfo.io API token, raising the anonymous rate limit")
+    args = ap.parse_args()
+
+    rep = report(args.local, args.token, args.timeout)
+    if args.text:
+        print_text(rep)
+    else:
+        json.dump(rep, sys.stdout, indent=2 if args.pretty else None)
+        sys.stdout.write("\n")
+
+    # The report is written, so there is nothing left to unwind for. A worker
+    # still blocked in getaddrinfo cannot be cancelled, and both the executor
+    # and concurrent.futures' own atexit hook would join it before the process
+    # was allowed to leave -- which the panel sees as a refresh that never
+    # finishes rather than as a lookup that timed out.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
