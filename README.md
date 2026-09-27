@@ -167,9 +167,9 @@ is a path queries can take around the tunnel whether or not they currently do.
 
 A route leaving the tunnel is only a leak if it goes anywhere. Where a VPN
 cannot carry IPv6 it commonly blocks it instead, by pointing the default IPv6
-route at a dummy device. With one common client that device is `ipv6leakintrf0`, held up
-by the `pvpn-killswitch-ipv6` connection. A dummy device discards everything routed
-into it, so packets are dropped on this machine and never reach the wire.
+route at a dummy device, which the client holds up with a kill switch
+connection of its own. A dummy device discards everything routed into it, so
+packets are dropped on this machine and never reach the wire.
 `ip route get` names that interface exactly as it would name a real escape, so
 the interface kind is checked before the verdict: a route into a sink is the
 kill switch working, and is reported green as "blocked". The same reasoning

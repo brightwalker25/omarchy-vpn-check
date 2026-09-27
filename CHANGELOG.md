@@ -160,8 +160,8 @@ First release.
 - A blocked IPv6 route is no longer called a leak. The row read the interface an
   IPv6 packet would leave by and called anything other than the tunnel an
   escape. A VPN that cannot carry IPv6 may block it with a default route into
-  a dummy device such as `ipv6leakintrf0`, held up by the `pvpn-killswitch-ipv6`
-  connection. A dummy discards what is routed into it, so those packets never
+  a dummy device, held up by a kill switch connection of its own. A dummy
+  discards what is routed into it, so those packets never
   reach the wire, but `ip route get` names that interface exactly as it would
   name a real escape. The panel reported "Leaking" while sitting directly below
   its own green "Kill switch: Active". The interface kind is now checked before

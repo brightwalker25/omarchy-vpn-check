@@ -62,7 +62,7 @@ PROBE_MCAST = "224.0.0.167"
 # kernels, so the name heuristic is a genuine fallback rather than belt and
 # braces.
 TUNNEL_KINDS = {"wireguard", "tun", "ppp", "vti", "vti6", "ipip", "gre"}
-TUNNEL_NAME_HINTS = ("tun", "tap", "wg", "proton", "nordlynx", "mullvad", "vpn")
+TUNNEL_NAME_HINTS = ("tun", "tap", "wg", "nordlynx", "mullvad", "vpn")
 
 # Interfaces that look like a tunnel but are scaffolding. one VPN client's IPv6
 # kill switch is a dummy device holding an unroutable address; treating it as
@@ -186,8 +186,8 @@ def kill_switch_cover(ifaces, tunnel):
     A kill switch is a device that swallows traffic plus a default route into
     it that beats the open connection's. The name of a NetworkManager
     connection is a label rather than the protection itself, and it is not
-    even a label for the whole machine: a kill switch connection such as `pvpn-killswitch-ipv6`
-    covers IPv6 alone, while IPv4 is guarded by a separate connection that
+    even a label for the whole machine: some clients hold one kill switch
+    connection for IPv6 alone, while IPv4 is guarded by a separate one that
     stays inactive unless the permanent kill switch is turned on. Answering
     the two families separately is the only way to avoid calling half a kill
     switch a whole one.
