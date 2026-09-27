@@ -7,6 +7,20 @@ Notable changes to the VPN Check plugin. Versions follow
 Every entry below is a correction to a verdict the panel was reporting, so
 each one is described in terms of what it used to say and what it says now.
 
+## [Unreleased]
+
+### Added
+
+- A "LAN discovery" row under Connection. It asks `ip route get 224.0.0.167`,
+  which sends nothing and so also runs in `--local`, whether link-local
+  multicast would leave by the LAN interface or go into the tunnel. A
+  policy-routed VPN commonly sends it into the tunnel, and then local discovery
+  such as LocalSend cannot find this machine while ordinary LAN traffic still
+  works. The row is green on the LAN, amber in the tunnel with the fix named (a
+  route for 224.0.0.0/24 on the LAN interface), and grey with no tunnel up or
+  with the kill switch discarding everything. It is advisory: nothing leaks, so
+  it never changes the headline or the bar colour.
+
 ## [0.2.1] - 2026-09-25
 
 ### Changed

@@ -145,6 +145,13 @@ not, and IPv4 would fall back to the named interface if the tunnel dropped. With
 some VPN clients the IPv4 guard is a separate connection that stays inactive unless the
 permanent kill switch is turned on.
 
+The "LAN discovery" row is amber. Link-local multicast is being routed into
+the tunnel, so local discovery such as LocalSend cannot see this machine while
+the VPN is up. A route for 224.0.0.0/24 on the LAN interface fixes it, for
+example `ip route add 224.0.0.0/24 dev eth0` for the current session, or the
+same route added to the LAN connection in NetworkManager to keep it. Nothing is
+leaking, which is why this row never changes the headline or the bar colour.
+
 The exit country looks wrong. It is where the operator has registered the
 address, not where the machine sits, and registration and geography differ often
 enough that it is worth checking the operator and AS on the same row first.

@@ -52,6 +52,11 @@ GEO_TTL_SECONDS = 7 * 24 * 3600
 PROBE_V4 = "1.1.1.1"
 PROBE_V6 = "2606:4700:4700::1111"
 
+# A link-local multicast group, used the same way. Local discovery such as
+# LocalSend announces on groups inside 224.0.0.0/24, and this is the one
+# LocalSend uses; any address in that block would give the same answer.
+PROBE_MCAST = "224.0.0.167"
+
 # Interface kinds that are a tunnel, and name prefixes for the ones that do
 # not announce a kind. OpenVPN's tun devices report no info_kind on some
 # kernels, so the name heuristic is a genuine fallback rather than belt and
@@ -720,14 +725,20 @@ def holder(g):
     return org or asn or ""
 
 
-def check(cid, label, value, status, detail=""):
-    return {
+def check(cid, label, value, status, detail="", advisory=False):
+    c = {
         "id": cid,
         "label": label,
         "value": value or "—",
         "status": status,  # ok | warn | bad | unknown
         "detail": detail,
     }
+    # An advisory row is drawn like any other but left out of the overall
+    # verdict, and so out of the headline and the bar colour. It is for a
+    # finding worth fixing that says nothing about whether traffic is safe.
+    if advisory:
+        c["advisory"] = True
+    return c
 
 
 WORST = {"unknown": 0, "ok": 1, "warn": 2, "bad": 3}
@@ -856,6 +867,11 @@ def snapshot(local_only=False, token=None, timeout=6.0):
 
     default4 = route_get(PROBE_V4)
     default6 = route_get(PROBE_V6)
+    # Where local multicast would go. A policy-routed VPN's fwmark rule
+    # catches it along with everything else unless a more specific route
+    # keeps it on the LAN, and then local discovery is shouting into the
+    # tunnel.
+    multicast = route_get(PROBE_MCAST)
     phys_v4 = ph["v4"][0] if ph and ph["v4"] else None
     phys_v6 = ph["v6"][0] if ph and ph["v6"] else None
     # Where a packet would go if something asked to send it from the physical
@@ -929,6 +945,8 @@ def snapshot(local_only=False, token=None, timeout=6.0):
         "routing": {"default4": default4, "default6": default6,
                     "bypass4": bypass4, "bypass6": bypass6,
                     "bound4": bound4, "bound6": bound6,
+                    "multicast": multicast,
+                    "multicastSink": is_sink(multicast, ifaces),
                     "default4Sink": is_sink(default4, ifaces),
                     "default6Sink": is_sink(default6, ifaces),
                     "bypass4Sink": is_sink(bypass4, ifaces),
@@ -1028,6 +1046,8 @@ def build_checks(s):
     else:
         add("Connection", "killswitch", "Kill switch", "Not detected", "warn",
             "Traffic may fall back to %s if the tunnel drops" % fallback)
+
+    add("Connection", *lan_discovery_check(s), advisory=True)
 
     # ---- Exit
     exit_ip = (exit4 or {}).get("ip")
@@ -1169,6 +1189,45 @@ def build_checks(s):
     # ---- IPv6
     add("IPv6", *ipv6_check(s, names))
     return out
+
+
+def lan_discovery_check(s):
+    """Whether devices on the local network can still find this machine.
+
+    Local discovery, LocalSend among it, announces on link-local multicast in
+    224.0.0.0/24. A policy-routed VPN sends that into the tunnel with
+    everything else, where no neighbour will ever hear it, so the machine
+    vanishes from the LAN while ordinary LAN traffic carries on working. It is
+    a convenience lost rather than anything exposed, which is why the row is
+    advisory: amber on its own line, and never in the headline or the bar.
+    """
+    r, ph = s["routing"], s["phys"]
+    tunnel = s["tunnel"]["iface"]
+    dev = r["multicast"]
+    lan = ph["iface"] or "the LAN interface"
+
+    if not dev:
+        return ("lan-discovery", "LAN discovery", "Unknown", "unknown",
+                "The routing table gave no answer for local multicast")
+    if r["multicastSink"]:
+        # The kill switch discarding multicast is the kill switch doing its
+        # job, and reconnecting fixes this along with everything else.
+        return ("lan-discovery", "LAN discovery", "Blocked", "unknown",
+                "Local multicast is discarded by %s along with everything else"
+                % dev)
+    if tunnel and dev == tunnel:
+        return ("lan-discovery", "LAN discovery", "Hidden from the LAN", "warn",
+                "Local multicast is routed into %s, so devices on this network "
+                "cannot find this machine through local discovery such as "
+                "LocalSend while the tunnel is up. A route for 224.0.0.0/24 on "
+                "%s fixes it without sending anything else around the tunnel"
+                % (tunnel, lan))
+    if not tunnel:
+        return ("lan-discovery", "LAN discovery", "No tunnel", "unknown",
+                "Local discovery is only affected while a tunnel is up")
+    return ("lan-discovery", "LAN discovery", "Via %s" % dev, "ok",
+            "Local multicast stays on the LAN, so devices on this network can "
+            "find this machine while the tunnel is up")
 
 
 def dns_location_check(geo4, geo6, exit4, names, unknown_detail):
@@ -1317,7 +1376,8 @@ HEADLINES = {
 def report(local_only=False, token=None, timeout=6.0):
     s = snapshot(local_only, token, timeout)
     checks = build_checks(s)
-    overall = worst_of([c for c in checks if c["status"] != "unknown"]) or "unknown"
+    overall = worst_of([c for c in checks
+                        if c["status"] != "unknown" and not c.get("advisory")]) or "unknown"
 
     headline = HEADLINES.get(overall, "Unknown")
     if s["routing"]["blocked"]:

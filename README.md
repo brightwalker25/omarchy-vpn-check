@@ -20,7 +20,7 @@ settings, running the collector by hand, and uninstalling.
 
 | Section | Rows |
 |---|---|
-| Connection | tunnel interface and protocol, whether traffic actually uses it, kill switch |
+| Connection | tunnel interface and protocol, whether traffic actually uses it, kill switch, whether devices on the LAN can still find this machine |
 | Exit | external IP, the operator hosting it and its AS number, the city and country |
 | Identity | your own address, and the ISP that issued it |
 | DNS | which resolvers can answer, the address queries surface from, where that is, whether it constitutes a leak, whether it is encrypted |
@@ -70,6 +70,28 @@ That is the rule the whole panel follows. Amber means something you can act on:
 a kill switch that is off, DNS in plaintext on a network you do not control, a
 real address never recorded. It does not mean a fact about how Linux routing
 works.
+
+### Local discovery, which is not a leak
+
+The same routing rule that keeps traffic in the tunnel can also swallow
+link-local multicast. `ip route get 224.0.0.167` is asked alongside the others,
+and on a policy-routed VPN it commonly answers with the tunnel: the fwmark rule
+catches multicast along with everything else. Local discovery such as LocalSend
+announces on 224.0.0.0/24, so while the tunnel is up devices on the local
+network cannot see this machine, though ordinary LAN traffic still works.
+
+The "LAN discovery" row reports that. It is green when multicast leaves by the
+LAN interface and amber when it would go into the tunnel, and the fix it names
+is a route for 224.0.0.0/24 on the LAN interface, which keeps local discovery
+on the LAN without sending anything else around the tunnel. The companion
+[Black Ops](https://github.com/brightwalker25/omarchy-black-ops) plugin has an
+optional row that adds it. With no tunnel up, or with the kill switch
+discarding everything, the row is grey rather than amber, because there is
+nothing about discovery to fix separately.
+
+Nothing leaks either way, so the row is advisory: its own dot turns amber, but
+it never counts toward the headline or the bar colour, and "Protected" means
+exactly what it meant before.
 
 ### Down is not the same as leaking
 
@@ -182,7 +204,8 @@ configuration from the kernel and the resolver alone: no packet leaves the
 machine, and it takes well under a tenth of a second. The tint is the worst of
 that and of any full check from the last fifteen minutes, so a DNS leak found
 with the panel open stays red after it closes. A check that could not run
-shows amber.
+shows amber. The advisory "LAN discovery" row is the one exception: it is
+never part of the tint.
 
 The full check, with its outbound lookups, still runs only while the panel is
 open.
