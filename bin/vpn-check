@@ -71,8 +71,8 @@ NOT_A_TUNNEL_KINDS = {"dummy", "bridge", "veth", "loopback"}
 
 # Interfaces that exist to swallow traffic. A dummy device discards whatever is
 # routed into it, which is how a kill switch blocks a family it cannot carry:
-# One VPN client parks a default IPv6 route on `ipv6leakintrf0` so v6 packets are
-# dropped locally instead of leaving beside the tunnel. A route landing here is
+# a VPN client may park a default IPv6 route on one so v6 packets are dropped
+# locally instead of leaving beside the tunnel. A route landing here is
 # the protection working, not an escape.
 SINK_KINDS = {"dummy"}
 
